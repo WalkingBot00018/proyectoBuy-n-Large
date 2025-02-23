@@ -2,13 +2,15 @@ from django.shortcuts import render
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from .models import Producto  # Importa el modelo correctamente
+from .models import Producto, ConsultaUsuario  # Importa el modelo de consultas
 from .serializers import ProductoSerializer
 from django.http import JsonResponse
 from collections import Counter
+from django.contrib.auth.models import User  # Para manejar usuarios
 
 # Simulación de historial de consultas para recomendaciones
 consulta_historial = Counter()
+usuario_historial = {}
 
 class ProductoListView(APIView):
     def get(self, request):
@@ -26,14 +28,29 @@ class ChatBotView(APIView):
 
     def post(self, request):
         pregunta = request.data.get("pregunta", "").lower()
+        usuario = request.user if request.user.is_authenticated else None
 
         if not pregunta:
             return Response({"mensaje": "⚠️ Por favor, ingresa una pregunta válida."}, status=status.HTTP_400_BAD_REQUEST)
 
         productos_respuesta = []
         productos_disponibles = Producto.objects.all()
+        producto_consultado = None
 
-        # Detectar qué información se busca en la pregunta
+        # 🔍 Buscar productos en la pregunta
+        for producto in productos_disponibles:
+            if producto.nombre.lower() in pregunta or producto.marca.lower() in pregunta:
+                producto_consultado = producto
+                break
+
+        # Registrar la consulta en la base de datos con el producto asociado si se encuentra, sino dejarlo como None
+        ConsultaUsuario.objects.create(usuario=usuario, consulta=pregunta, producto=producto_consultado)
+
+        # Inicializar historial de usuario
+        if usuario not in usuario_historial:
+            usuario_historial[usuario] = Counter()
+
+        # 🔍 Detectar qué información se busca en la pregunta
         pregunta_stock = any(kw in pregunta for kw in ["cuántos", "stock", "disponibles"])
         pregunta_precio = any(kw in pregunta for kw in ["precio", "cuánto cuesta", "vale"])
         pregunta_marca = any(kw in pregunta for kw in ["marca", "de qué marca", "qué marca", "de qué marca es"])
@@ -42,77 +59,55 @@ class ChatBotView(APIView):
         pregunta_mas_consultados = any(kw in pregunta for kw in ["productos más consultados", "más buscados", "populares"])
         pregunta_productos_stock = any(kw in pregunta for kw in ["qué productos tienen en stock", "productos disponibles"])
 
-        # Caso especial: Listar todos los productos en la tienda
+        # 📌 Caso especial: Listar todos los productos en la tienda
         if pregunta_lista_productos:
             productos_respuesta = [{"producto": p.nombre, "marca": p.marca} for p in productos_disponibles]
-            if productos_respuesta:
-                return Response({"mensaje": "📝 Estos son los productos disponibles en nuestra tienda:", "productos": productos_respuesta}, status=status.HTTP_200_OK)
-            else:
-                return Response({"mensaje": "😕 No hay productos disponibles en este momento."}, status=status.HTTP_404_NOT_FOUND)
+            return Response({"mensaje": "📝 Estos son los productos disponibles en nuestra tienda:", "productos": productos_respuesta}, status=status.HTTP_200_OK)
 
-        # Caso especial: Contar todos los productos
+        # 📌 Caso especial: Contar todos los productos
         if pregunta_total_productos:
             total = productos_disponibles.count()
             return Response({"mensaje": f"Actualmente tenemos {total} productos en nuestra tienda. 🛒"}, status=status.HTTP_200_OK)
 
-        # Caso especial: Productos más consultados
+        # 📌 Caso especial: Productos más consultados
         if pregunta_mas_consultados:
-            if consulta_historial:
-                recomendaciones = consulta_historial.most_common(3)  # Top 3 productos más consultados
-                recomendaciones_lista = [rec[0] for rec in recomendaciones]
-            else:
-                # Si no hay datos en el historial, recomendar productos disponibles
-                recomendaciones_lista = [f"{p.nombre} ({p.marca})" for p in productos_disponibles[:3]]
+            recomendaciones = usuario_historial.get(usuario, Counter()).most_common(3)
+            recomendaciones_lista = [rec[0] for rec in recomendaciones] if recomendaciones else []
+            return Response({"mensaje": "🔥 Estos son los productos más consultados por ti:", "productos_mas_consultados": recomendaciones_lista}, status=status.HTTP_200_OK)
 
-            return Response({
-                "mensaje": "🔥 Estos son los productos más consultados por nuestros clientes:",
-                "productos_mas_consultados": recomendaciones_lista
-            }, status=status.HTTP_200_OK)
-
-        # Caso especial: Productos en stock
+        # 📌 Caso especial: Productos en stock
         if pregunta_productos_stock:
             productos_respuesta = [{"producto": p.nombre, "marca": p.marca, "stock": p.stock} for p in productos_disponibles if p.stock > 0]
-            if productos_respuesta:
-                return Response({"mensaje": "📦 Estos productos están en stock:", "productos": productos_respuesta}, status=status.HTTP_200_OK)
+            return Response({"mensaje": "📦 Estos productos están en stock:", "productos": productos_respuesta}, status=status.HTTP_200_OK)
+
+        # 📌 Buscar productos en la pregunta
+        if producto_consultado:
+            usuario_historial[usuario][producto_consultado.nombre] += 1  # Guardar consulta del usuario
+            producto_info = {"producto": producto_consultado.nombre}
+
+            if pregunta_stock:
+                producto_info["stock"] = producto_consultado.stock
+            elif pregunta_precio:
+                producto_info["precio"] = f"${producto_consultado.precio:,.2f}"
+            elif pregunta_marca:
+                producto_info["marca"] = producto_consultado.marca
             else:
-                return Response({"mensaje": "😕 No hay productos en stock actualmente."}, status=status.HTTP_404_NOT_FOUND)
+                # Si no se especifica qué se quiere saber, se muestra toda la info
+                producto_info["marca"] = producto_consultado.marca
+                producto_info["stock"] = producto_consultado.stock
+                producto_info["precio"] = f"${producto_consultado.precio:,.2f}"
 
-        # Diccionario de sinónimos de productos
-        sinonimos_productos = {
-            "computador": ["computadora", "pc", "laptop"],
-            "teclado": ["keyboard"],
-            "monitor": ["pantalla", "display"],
-            "mouse": ["ratón"],
-            "impresora": ["printer"],
-            "televisor": ["tv", "pantalla", "smart tv"],
-            "nevera": ["refrigerador", "frigorífico"],
-            "celular": ["móvil", "smartphone", "teléfono"],
-            "tablet": ["tableta", "ipad"],
-            "consola": ["playstation", "xbox", "nintendo"]
-        }
-
-        # Buscar productos en la pregunta
-        for producto in productos_disponibles:
-            nombres_posibles = [producto.nombre.lower(), producto.marca.lower()]
-            for key, values in sinonimos_productos.items():
-                if producto.nombre.lower() in values or producto.nombre.lower() == key:
-                    nombres_posibles.extend(values)
-                    nombres_posibles.append(key)
-
-            if any(nombre in pregunta for nombre in nombres_posibles):
-                producto_info = {"producto": producto.nombre, "marca": producto.marca}
-                consulta_historial[f"{producto.nombre} ({producto.marca})"] += 1  # Registrar consulta
-
-                if pregunta_stock:
-                    producto_info = {"producto": producto.nombre, "stock": producto.stock}
-                elif pregunta_precio:
-                    producto_info = {"producto": producto.nombre, "precio": f"${producto.precio:,.2f}"}
-                elif pregunta_marca:
-                    producto_info = {"producto": producto.nombre, "marca": producto.marca}
-                
-                productos_respuesta.append(producto_info)
+            productos_respuesta.append(producto_info)
 
         if productos_respuesta:
-            return Response({"mensaje": "📦 ¡Aquí tienes la información de los productos que encontré para ti!", "productos": productos_respuesta}, status=status.HTTP_200_OK)
+            # Generar recomendaciones según historial del usuario
+            recomendaciones = usuario_historial.get(usuario, Counter()).most_common(3)
+            recomendaciones_lista = [rec[0] for rec in recomendaciones]
+
+            return Response({
+                "mensaje": "📦 ¡Aquí tienes la información de los productos que encontré para ti!",
+                "productos": productos_respuesta,
+                "recomendaciones": recomendaciones_lista
+            }, status=status.HTTP_200_OK)
 
         return Response({"mensaje": "😕 No encontré información sobre esos productos en nuestra tienda. ¿Te gustaría preguntar por otro?"}, status=status.HTTP_404_NOT_FOUND)
